@@ -1,0 +1,8 @@
+# Pixiv 网页结构示例（用于开发参考，不提交）
+网页结构示例/
+
+# 图标原始文件（Python 生成脚本，不提交）
+icons/_raw/
+
+# WorkBuddy 工作目录
+.workbuddy/
