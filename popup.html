@@ -86,11 +86,63 @@
 
     .status.success { color: #2e7d32; }
     .status.error   { color: #d32f2f; }
+
+    .global-mode {
+      margin-bottom: 12px;
+      display: flex;
+      justify-content: center;
+    }
+    .switch-label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .switch-label input {
+      width: 34px;
+      height: 18px;
+      appearance: none;
+      background: #ccc;
+      border-radius: 20px;
+      position: relative;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .switch-label input:checked {
+      background: #0096fa;
+    }
+    .switch-label input::before {
+      content: "";
+      width: 14px;
+      height: 14px;
+      background: white;
+      border-radius: 50%;
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      transition: transform 0.2s;
+    }
+    .switch-label input:checked::before {
+      transform: translateX(16px);
+    }
+    .mode-text {
+      color: #555;
+    }
   </style>
 </head>
 <body>
   <div class="title">✦ Pixiv Helper</div>
   <div class="divider"></div>
+
+  <div class="global-mode">
+    <label class="switch-label">
+      <input type="checkbox" id="globalModeToggle">
+      <span class="slider"></span>
+      <span class="mode-text">对所有 Pixiv 页面操作</span>
+    </label>
+  </div>
 
   <button id="likeBtn">
     <span class="btn-icon">👍</span>

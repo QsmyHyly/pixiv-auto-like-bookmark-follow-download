@@ -3,7 +3,7 @@
   "name": "Pixiv Auto Like & Follow & Save",
   "version": "1.0",
   "description": "在pixiv作品页自动点赞、关注作者、保存原图",
-  "permissions": ["activeTab", "downloads", "storage"],
+  "permissions": ["activeTab", "downloads", "storage", "tabs"],
   "host_permissions": ["https://www.pixiv.net/*", "https://i.pximg.net/*"],
   "action": {
     "default_popup": "popup.html",

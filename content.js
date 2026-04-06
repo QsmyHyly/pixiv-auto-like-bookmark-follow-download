@@ -37,6 +37,22 @@
   const LOG = '[Pixiv Helper]';
 
   // ─────────────────────────────────────────────────────────────
+  //  工具：向 Service Worker 上报错误
+  // ─────────────────────────────────────────────────────────────
+  function reportError(errorAction, errorMessage, errorDetail = '', errorStack = '') {
+    chrome.runtime.sendMessage({
+      action: 'reportError',
+      errorAction,
+      errorMessage,
+      errorDetail,
+      errorStack
+    }).catch(err => {
+      // Service Worker 可能未激活，仅本地记录
+      console.warn(`${LOG} 无法上报错误到 Service Worker:`, err.message);
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
   //  工具：等待 DOM 元素出现
   // ─────────────────────────────────────────────────────────────
   function waitForElement(selector, timeout = 10000) {
@@ -179,6 +195,7 @@
       return true;
     } catch (e) {
       console.warn(`${LOG} [Like] ✗ 点赞失败:`, e.message);
+      reportError('like', e.message, '点赞操作失败', e.stack || '');
 
       // 额外诊断：列出页面上所有可能的按钮
       const candidates = document.querySelectorAll(
@@ -242,6 +259,7 @@
       return false;
     } catch (e) {
       console.warn(`${LOG} [Follow] ✗ 关注失败:`, e.message);
+      reportError('follow', e.message, '关注操作失败', e.stack || '');
       return false;
     }
   }
@@ -315,6 +333,7 @@
       return true;
     } catch (e) {
       console.warn(`${LOG} [Bookmark] ✗ 收藏失败:`, e.message);
+      reportError('bookmark', e.message, '收藏操作失败', e.stack || '');
 
       // 诊断：列出所有包含 bookmark 的按钮
       const candidates = document.querySelectorAll(
