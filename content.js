@@ -36,6 +36,86 @@
 
   const LOG = '[Pixiv Helper]';
 
+  // ═══════════════════════════════════════════════════════════════
+  //  选择器配置系统
+  //  优先级：用户自定义(chrome.storage.local) > 内置默认值
+  //  扩展更新时自带新默认值，用户覆盖值持久保留
+  // ═══════════════════════════════════════════════════════════════
+  const DEFAULT_SELECTORS = {
+    like:            'button.style_button__c7Nvf',
+    liked:           'style_liked__EIbS8',
+    bookmark:        'button.gtm-main-bookmark',
+    follow:          'button[data-click-label="follow"]',
+    expandContainer: '.gtm-expand-full-size-illust',
+    expandLink:      'a.gtm-expand-full-size-illust',
+    imgOriginal:     'a[href*="img-original"]',
+  };
+
+  /**
+   * 从 storage 读取用户自定义选择器，合并默认值
+   * @returns {Promise<Object>} 合并后的选择器映射
+   */
+  async function loadSelectors() {
+    try {
+      const data = await chrome.storage.local.get('selectors');
+      const user = (data && data.selectors) || {};
+      // 用户配置优先，缺失的用默认值补全
+      return { ...DEFAULT_SELECTORS, ...user };
+    } catch (e) {
+      return { ...DEFAULT_SELECTORS };
+    }
+  }
+
+  /**
+   * 上下文定位：从稳定的收藏按钮推导点赞按钮位置
+   * 不依赖 hash 类名，作为最后防线
+   * @returns {Element|null}
+   */
+  async function findLikeButtonByContext() {
+    console.log(`${LOG} [Like] 尝试上下文定位...`);
+    try {
+      // 找到稳定的收藏按钮锚点
+      const bookmarkBtn = await waitForElement('button.gtm-main-bookmark', 5000);
+
+      // 向上查找工具栏容器（包含多个按钮的父元素）
+      let toolbar = bookmarkBtn.parentElement;
+      for (let i = 0; i < 6 && toolbar; i++) {
+        const btns = toolbar.querySelectorAll('button');
+        if (btns.length >= 2) break;
+        toolbar = toolbar.parentElement;
+      }
+      if (!toolbar) return null;
+
+      // 工具栏中找点赞按钮：第一个非已知按钮 + 有 SVG 图标
+      const buttons = toolbar.querySelectorAll('button');
+      const knownLabels = ['bookmark', 'follow', 'comment', 'share'];
+
+      for (const btn of buttons) {
+        const label = btn.getAttribute('data-click-label') || '';
+        if (knownLabels.includes(label)) continue;
+
+        const svg = btn.querySelector('svg');
+        const text = (btn.textContent || '').trim();
+        if (svg && text.length < 10) {
+          console.log(`${LOG} [Like] 上下文定位成功: class="${btn.className}"`);
+          return btn;
+        }
+      }
+
+      // 宽松匹配：返回第一个非已知按钮
+      for (const btn of buttons) {
+        const label = btn.getAttribute('data-click-label') || '';
+        if (!knownLabels.includes(label)) {
+          console.log(`${LOG} [Like] 上下文定位(宽松): class="${btn.className}"`);
+          return btn;
+        }
+      }
+    } catch (e) {
+      console.log(`${LOG} [Like] 上下文定位失败: ${e.message}`);
+    }
+    return null;
+  }
+
   // ─────────────────────────────────────────────────────────────
   //  工具：向 Service Worker 上报错误
   // ─────────────────────────────────────────────────────────────
@@ -82,51 +162,61 @@
   }
 
   // ─────────────────────────────────────────────────────────────
-  //  工具：模拟鼠标中键点击（auxclick）
+  //  工具：从 DOM 元素在新标签页打开图片（多路顺序 fallback）
   //  在新标签页中打开链接，浏览器会自动携带正确的 Referer/Cookie
   //  避免 i.pximg.net 的 403 Forbidden
+  //
+  //  Fallback 链（按可靠性排序，一个失败才试下一个）：
+  //    1. chrome.tabs.create — 扩展 API，绕过弹窗拦截器，最可靠
+  //    2. window.open        — 可能被弹窗拦截器拦截
+  //    3. dispatchEvent auxclick — 部分浏览器可能响应
   // ─────────────────────────────────────────────────────────────
-  function simulateMiddleClick(element) {
-    // 方式1：通过 dispatchEvent 触发 auxclick
-    element.dispatchEvent(new PointerEvent('pointerdown', {
-      button: 1, bubbles: true, cancelable: true, composed: true
-    }));
-    element.dispatchEvent(new MouseEvent('mousedown', {
-      button: 1, bubbles: true, cancelable: true
-    }));
-    element.dispatchEvent(new MouseEvent('mouseup', {
-      button: 1, bubbles: true, cancelable: true
-    }));
-    element.dispatchEvent(new MouseEvent('auxclick', {
-      button: 1, bubbles: true, cancelable: true
-    }));
-
-    // 方式2：如果元素有 href，直接用 window.open 作为后备
-    // （某些浏览器可能不响应 programmatic auxclick）
-    if (element.href) {
-      // 延迟一点，避免被 preventDefault 拦截
-      setTimeout(() => {
-        const a = document.createElement('a');
-        a.href = element.href;
-        a.target = '_blank';
-        a.rel = 'noopener';
-        a.style.display = 'none';
-        document.body.appendChild(a);
-        // 模拟 Ctrl+Click（等效于中键）
-        a.dispatchEvent(new MouseEvent('click', {
-          button: 0,
-          ctrlKey: true,
-          metaKey: false,
-          bubbles: true,
-          cancelable: true
-        }));
-        // 清理
-        setTimeout(() => a.remove(), 500);
-      }, 100);
+  async function openImageFromElement(element) {
+    const url = element.href;
+    if (!url) {
+      console.warn(`${LOG} [Save] 元素无 href，无法打开`);
+      return false;
     }
 
-    console.log(`${LOG} 已模拟中键点击，图片将在新标签页打开`);
-    return true;
+    // 方式1：chrome.tabs.create（扩展 API，绕过弹窗拦截器）
+    try {
+      const tab = await chrome.tabs.create({ url, active: false });
+      if (tab) {
+        console.log(`${LOG} [Save] ✓ tabs.create 打开: ${url}`);
+        return true;
+      }
+    } catch (e) {
+      console.log(`${LOG} [Save] tabs.create 失败: ${e.message}`);
+    }
+
+    // 方式2：window.open（可能被弹窗拦截器拦截）
+    const win = window.open(url, '_blank', 'noopener');
+    if (win) {
+      console.log(`${LOG} [Save] ✓ window.open 打开: ${url}`);
+      return true;
+    }
+    console.log(`${LOG} [Save] window.open 被拦截，尝试 auxclick...`);
+
+    // 方式3：dispatchEvent auxclick（最后手段）
+    try {
+      element.dispatchEvent(new PointerEvent('pointerdown', {
+        button: 1, bubbles: true, cancelable: true, composed: true
+      }));
+      element.dispatchEvent(new MouseEvent('mousedown', {
+        button: 1, bubbles: true, cancelable: true
+      }));
+      element.dispatchEvent(new MouseEvent('mouseup', {
+        button: 1, bubbles: true, cancelable: true
+      }));
+      element.dispatchEvent(new MouseEvent('auxclick', {
+        button: 1, bubbles: true, cancelable: true
+      }));
+      console.log(`${LOG} [Save] 已尝试 auxclick 事件（浏览器可能忽略）`);
+    } catch (e) {
+      console.log(`${LOG} [Save] auxclick 失败: ${e.message}`);
+    }
+
+    return false;
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -148,16 +238,52 @@
   }
 
   // ═══════════════════════════════════════════════════════════════
-  //  点赞（增加详细诊断日志）
+  //  点赞（完整 fallback 链：用户选择器 → 默认选择器 → 上下文定位 → 诊断）
   // ═══════════════════════════════════════════════════════════════
   async function clickLike() {
     try {
-      console.log(`${LOG} [Like] 开始查找点赞按钮...`);
+      const selectors = await loadSelectors();
+      const likeSelector = selectors.like;
+      const likedClass  = selectors.liked;
 
-      const likeBtn = await waitForElement('button.style_button__c7Nvf');
+      console.log(`${LOG} [Like] 使用选择器: like="${likeSelector}", liked="${likedClass}"`);
+
+      // ── 第1路：尝试当前选择器 ──────────────────────────
+      let likeBtn = null;
+      let foundBy = '';
+
+      try {
+        likeBtn = await waitForElement(likeSelector);
+        foundBy = 'selector';
+      } catch (_) {
+        console.log(`${LOG} [Like] 选择器 "${likeSelector}" 未匹配，尝试上下文定位...`);
+      }
+
+      // ── 第2路：上下文定位（从收藏按钮推导） ─────────────
+      if (!likeBtn) {
+        likeBtn = await findLikeButtonByContext();
+        if (likeBtn) foundBy = 'context';
+      }
+
+      // ── 第3路：全部失败，输出诊断 ──────────────────────
+      if (!likeBtn) {
+        console.warn(`${LOG} [Like] ✗ 所有方式均未找到点赞按钮`);
+        const candidates = document.querySelectorAll(
+          'button[class*="button"], button[data-click-label], button[aria-label]'
+        );
+        if (candidates.length > 0) {
+          console.log(`${LOG} [Like] 诊断 - 页面上的候选按钮:`);
+          candidates.forEach((btn, idx) => {
+            if (idx < 15) {
+              console.log(`  [${idx}] class="${btn.className}" label="${btn.getAttribute('aria-label') || ''}" text="${(btn.innerText||'').trim().substring(0, 40)}" data-click-label="${btn.getAttribute('data-click-label') || ''}"`);
+            }
+          });
+        }
+        return false;
+      }
 
       // ── 详细诊断输出 ──
-      console.log(`${LOG} [Like] 找到按钮:`, {
+      console.log(`${LOG} [Like] 找到按钮 (via ${foundBy}):`, {
         tagName: likeBtn.tagName,
         className: likeBtn.className,
         allClasses: [...likeBtn.classList],
@@ -168,8 +294,8 @@
       });
 
       // 检查是否已点赞
-      const isLiked = likeBtn.classList.contains('style_liked__EIbS8');
-      console.log(`${LOG} [Like] 已点赞检测: style_liked__EIbS8 = ${isLiked}`);
+      const isLiked = likeBtn.classList.contains(likedClass);
+      console.log(`${LOG} [Like] 已点赞检测: ${likedClass} = ${isLiked}`);
 
       if (isLiked) {
         console.log(`${LOG} [Like] 已点赞，跳过`);
@@ -181,35 +307,12 @@
         return false;
       }
 
-      // 额外安全检查：遍历页面上所有匹配的按钮，确认选中的是正确的
-      const allBtns = document.querySelectorAll('button.style_button__c7Nvf');
-      if (allBtns.length > 1) {
-        console.warn(`${LOG} [Like] ⚠️ 页面上找到 ${allBtns.length} 个匹配按钮，使用了第一个`);
-        allBtns.forEach((btn, idx) => {
-          console.log(`  [${idx}] class="${btn.className}" text="${(btn.innerText||'').trim().substring(0, 30)}"`);
-        });
-      }
-
       likeBtn.click();
       console.log(`${LOG} [Like] ✓ 点赞成功`);
       return true;
     } catch (e) {
       console.warn(`${LOG} [Like] ✗ 点赞失败:`, e.message);
       reportError('like', e.message, '点赞操作失败', e.stack || '');
-
-      // 额外诊断：列出页面上所有可能的按钮
-      const candidates = document.querySelectorAll(
-        'button[class*="button"], button[data-click-label], button[aria-label]'
-      );
-      if (candidates.length > 0) {
-        console.log(`${LOG} [Like] 诊断 - 页面上的候选按钮:`);
-        candidates.forEach((btn, idx) => {
-          if (idx < 15) {
-            console.log(`  [${idx}] class="${btn.className}" label="${btn.getAttribute('aria-label') || ''}" text="${(btn.innerText||'').trim().substring(0, 40)}"`);
-          }
-        });
-      }
-
       return false;
     }
   }
@@ -219,9 +322,12 @@
   // ═══════════════════════════════════════════════════════════════
   async function clickFollow() {
     try {
-      console.log(`${LOG} [Follow] 开始查找关注按钮...`);
+      const selectors = await loadSelectors();
+      const followSelector = selectors.follow;
 
-      const followBtn = await waitForElement('button[data-click-label="follow"]');
+      console.log(`${LOG} [Follow] 使用选择器: "${followSelector}"`);
+
+      const followBtn = await waitForElement(followSelector);
 
       const text = (followBtn.textContent || followBtn.innerText || '').trim();
 
@@ -240,8 +346,7 @@
         text.includes('フォロー') ||
         text.includes('Follow');
 
-      const isPrimary = followBtn.getAttribute('data-variant') === 'Primary' ||
-                        followBtn.dataset.variant === 'Primary';
+      const isPrimary = followBtn.getAttribute('data-variant') === 'Primary';
 
       console.log(`${LOG} [Follow] 判断: textMatch=${isUnfollowed}, variantPrimary=${isPrimary}`);
 
@@ -266,14 +371,16 @@
 
   // ═══════════════════════════════════════════════════════════════
   //  收藏（添加书签）
-  //  选择器：button.gtm-main-bookmark（心形图标按钮）
-  //  防重复：检查 SVG 内部的 filled path 是否有 fill 属性
+  //  选择器可配置，防重复：aria-label + SVG mask 双重检测
   // ═══════════════════════════════════════════════════════════════
   async function clickBookmark() {
     try {
-      console.log(`${LOG} [Bookmark] 开始查找收藏按钮...`);
+      const selectors = await loadSelectors();
+      const bookmarkSelector = selectors.bookmark;
 
-      const bookmarkBtn = await waitForElement('button.gtm-main-bookmark');
+      console.log(`${LOG} [Bookmark] 使用选择器: "${bookmarkSelector}"`);
+
+      const bookmarkBtn = await waitForElement(bookmarkSelector);
 
       // ── 详细诊断输出 ──
       console.log(`${LOG} [Bookmark] 找到按钮:`, {
@@ -285,32 +392,28 @@
         outerHTML: bookmarkBtn.outerHTML.substring(0, 400),
       });
 
-      // 检查是否已收藏
-      // 已收藏时：SVG 中第二个 <path>（心形填充部分）没有 fill="none" 或有实际 fill 色
-      // 未收藏时：第二个 <path> class 含 "jgGXut"，且被 mask 遮罩（mask 内的心形是镂空的）
-      // 更可靠的方式：检查按钮的 aria-label 或 data 属性
+      // 检查是否已收藏（双重检测，任一命中即为已收藏）
       //
-      // 从用户提供 HTML 分析：
-      //   未收藏：mask 内有心形 path（class="sc-16466e35-0 jgGXut"），视觉上为空心
-      //   已收藏：可能 class 变化，或 fill 变化
-      //
-      // 实际检测策略：
-      // 1. 检查 aria-label（如有"收藏済み"/"已收藏"等关键词表示已收藏）
-      // 2. 检查 SVG path 的 mask 引用：有 mask id 通常是未收藏
+      // 检测策略：
+      // 1. aria-label 关键词（最可靠）
+      //    - 已收藏时含"済み"/"已收藏"/"Bookmarked"/"Saved"
+      // 2. SVG mask 检测（辅助）
+      //    - 未收藏时：心形通过 mask 遮罩实现镂空效果，SVG 内含 <mask> 元素
+      //    - 已收藏时：心形为实心填充，无 mask 元素
       const svgEl = bookmarkBtn.querySelector('svg');
       const hasMask = svgEl && svgEl.querySelector('mask') !== null;
 
-      console.log(`${LOG} [Bookmark] SVG mask 检测: hasMask=${hasMask}`);
-
-      // 检查 aria-label
       const ariaLabel = bookmarkBtn.getAttribute('aria-label') || '';
-      const isBookmarked =
+      const labelIndicatesBookmarked =
         ariaLabel.includes('済み') ||  // 日本語 "ブックマーク済み"
         ariaLabel.includes('已收藏') ||
         ariaLabel.includes('Saved') ||
         ariaLabel.includes('Bookmarked');
 
-      console.log(`${LOG} [Bookmark] aria-label="${ariaLabel}", isBookmarked=${isBookmarked}`);
+      // 双重检测：aria-label 明确表示已收藏，或没有 mask（实心心形）
+      const isBookmarked = labelIndicatesBookmarked || !hasMask;
+
+      console.log(`${LOG} [Bookmark] aria-label="${ariaLabel}", hasMask=${hasMask}, isBookmarked=${isBookmarked}`);
 
       if (isBookmarked) {
         console.log(`${LOG} [Bookmark] 已收藏，跳过`);
@@ -323,7 +426,7 @@
       }
 
       // 额外安全检查：列出匹配的按钮
-      const allBtns = document.querySelectorAll('button.gtm-main-bookmark');
+      const allBtns = document.querySelectorAll(bookmarkSelector);
       if (allBtns.length > 1) {
         console.warn(`${LOG} [Bookmark] ⚠️ 页面上找到 ${allBtns.length} 个匹配按钮，使用了第一个`);
       }
@@ -398,32 +501,33 @@
   //  确保 DOM 中的图片展开状态（获取 <a> 标签而非 <div>）
   // ═══════════════════════════════════════════════════════════════
   async function ensureExpandedAndGetLink() {
+    const selectors = await loadSelectors();
+    const expandLinkSel  = selectors.expandLink;
+    const containerSel   = selectors.expandContainer;
+    const imgOriginalSel = selectors.imgOriginal;
+
     // 先尝试直接找 <a>
     try {
-      const aLink = await waitForElement('a.gtm-expand-full-size-illust', 3000);
+      const aLink = await waitForElement(expandLinkSel, 3000);
       if (aLink && aLink.href) {
         console.log(`${LOG} [Save] DOM 已展开，找到 <a href="${aLink.href}">`);
         return aLink;
       }
     } catch (_) {}
 
-    // 找到 <div> 版本，点击触发展开
+    // 找到容器（可能是 <div> 或 <a>），点击触发展开
     console.log(`${LOG} [Save] DOM 未展开，尝试点击触发展开...`);
     try {
-      const container = document.querySelector('.gtm-expand-full-size-illust');
-      if (container) {
-        console.log(`${LOG} [Save] 找到容器: ${container.tagName.toLowerCase()}, class="${container.className}"`);
+      const container = await waitForElement(containerSel, 5000);
+      console.log(`${LOG} [Save] 找到容器: ${container.tagName.toLowerCase()}, class="${container.className}"`);
 
-        // 模拟左键点击展开
-        simulateLeftClick(container);
-        await delay(1000); // 等待 React 渲染
+      simulateLeftClick(container);
+      await delay(1500);
 
-        // 尝试找 <a>
-        const aLink = await waitForElement('a.gtm-expand-full-size-illust', 5000);
-        if (aLink && aLink.href) {
-          console.log(`${LOG} [Save] 展开后找到 <a href="${aLink.href}">`);
-          return aLink;
-        }
+      const aLink = await waitForElement(expandLinkSel, 5000);
+      if (aLink && aLink.href) {
+        console.log(`${LOG} [Save] 展开后找到 <a href="${aLink.href}">`);
+        return aLink;
       }
     } catch (e) {
       console.warn(`${LOG} [Save] 展开失败:`, e.message);
@@ -431,7 +535,7 @@
 
     // 最终备用：任意包含 img-original 的链接
     try {
-      const fallback = await waitForElement('a[href*="img-original"]', 3000);
+      const fallback = await waitForElement(imgOriginalSel, 3000);
       if (fallback && fallback.href) {
         console.log(`${LOG} [Save] 备用找到链接: ${fallback.href}`);
         return fallback;
@@ -444,11 +548,10 @@
   // ═══════════════════════════════════════════════════════════════
   //  保存原图（核心函数）
   //
-  //  策略：
+  //  策略（多路顺序 fallback）：
   //  1. 通过 Ajax API 获取所有分页 URL（_p0, _p1, _p2...）
-  //  2. 对每个 URL，在 DOM 中找到对应的 <a> 标签并模拟中键点击
-  //     → 浏览器自动携带正确的 Referer/Cookie，避免 403
-  //  3. 如果无法中键点击（比如 DOM 不支持），退化为 window.open
+  //  2. 对每个 URL，按优先级尝试：tabs.create → window.open → downloads
+  //  3. 若 API 失败，退化为纯 DOM 操作
   // ═══════════════════════════════════════════════════════════════
   async function saveOriginalImage() {
     const illustId = getIllustId();
@@ -489,56 +592,47 @@
     if (imageList.length > 0) {
       console.log(`${LOG} [Save] 共 ${imageList.length} 张图片需要保存`);
 
-      let successCount = 0;
-
       if (imageList.length === 1) {
-        // 单图：直接用 DOM 链接中键点击
-        const target = domLink || null;
-        if (target && target.tagName.toLowerCase() === 'a') {
-          console.log(`${LOG} [Save] → 模拟中键点击: ${target.href}`);
-          simulateMiddleClick(target);
-          successCount = 1;
-        } else if (target) {
-          // <div> 状态，先展开
+        // 单图：优先用 DOM 链接（自带 Referer），否则用 API URL
+        if (domLink && domLink.tagName.toLowerCase() === 'a' && domLink.href) {
+          console.log(`${LOG} [Save] → 使用 DOM 链接打开`);
+          return await openImageFromElement(domLink);
+        } else if (domLink) {
+          // <div> 状态，左键打开查看器
           console.log(`${LOG} [Save] → 模拟左键展开查看器（请在查看器中右键另存为）`);
-          simulateLeftClick(target);
-          successCount = 1;
+          simulateLeftClick(domLink);
+          return true;
         } else {
-          // 无 DOM 链接，用 API URL 创建临时 <a> 中键点击
+          // 无 DOM 链接，用 API URL
           console.log(`${LOG} [Save] → 无 DOM 链接，使用 API URL`);
-          const url = imageList[0].url;
-          simulateMiddleClickWithUrl(url);
-          successCount = 1;
+          return await openImageFromUrl(imageList[0].url);
         }
       } else {
-        // 多图：逐个处理
+        // 多图：逐个用 API URL 打开
+        let successCount = 0;
         for (let i = 0; i < imageList.length; i++) {
           const { url } = imageList[i];
-          console.log(`${LOG} [Save] → [${i}/${imageList.length - 1}] ${url}`);
+          console.log(`${LOG} [Save] → [${i + 1}/${imageList.length}] ${url}`);
 
-          await delay(500); // 间隔避免浏览器拦截弹窗
-
-          // 对于每张图，创建临时 <a> 标签模拟中键点击
-          simulateMiddleClickWithUrl(url);
-          successCount++;
+          await delay(600); // 间隔避免浏览器限流
+          const ok = await openImageFromUrl(url);
+          if (ok) successCount++;
         }
 
-        console.log(`${LOG} [Save] ✓ 已在新标签页中打开 ${successCount} 张图片`);
-        console.log(`${LOG} [Save] 提示：浏览器可能拦截了多个弹窗，请允许本站弹出窗口`);
+        console.log(`${LOG} [Save] ✓ 成功打开 ${successCount}/${imageList.length} 张图片`);
+        if (successCount < imageList.length) {
+          console.log(`${LOG} [Save] 提示：部分图片可能被拦截，请允许本站弹出窗口`);
+        }
+        return successCount > 0;
       }
-
-      return successCount > 0;
     }
 
-    // ── 备用方案：纯 DOM 操作 ───────────────────────────────
+    // ── 步骤4：纯 DOM 备用（API 完全失败时） ─────────────────
     if (domLink) {
-      console.log(`${LOG} [Save] 使用备用 DOM 方式...`);
+      console.log(`${LOG} [Save] API 无数据，使用纯 DOM 方式...`);
       if (domLink.tagName.toLowerCase() === 'a' && domLink.href) {
-        // 已展开的 <a>：中键点击
-        simulateMiddleClick(domLink);
-        return true;
+        return await openImageFromElement(domLink);
       } else {
-        // 未展开的 <div>：左键点击打开查看器
         simulateLeftClick(domLink);
         console.log(`${LOG} [Save] 已在查看器中打开，请右键另存为保存原图`);
         return true;
@@ -550,39 +644,48 @@
   }
 
   // ─────────────────────────────────────────────────────────────
-  //  工具：通过 URL 模拟中键点击（创建临时 <a> 标签）
+  //  工具：通过纯 URL 在新标签页打开图片（多路顺序 fallback）
+  //
+  //  Fallback 链（按可靠性排序，一个失败才试下一个）：
+  //    1. chrome.tabs.create      — 扩展 API，最可靠
+  //    2. window.open             — 可能被弹窗拦截器拦截
+  //    3. chrome.downloads        — 直接下载到本地（通过 background.js）
   // ─────────────────────────────────────────────────────────────
-  function simulateMiddleClickWithUrl(url) {
-    // 方式A：创建 <a> 标签模拟中键点击
-    const a = document.createElement('a');
-    a.href = url;
-    a.target = '_blank';
-    a.rel = 'noopener';
-    a.style.display = 'none';
-    document.body.appendChild(a);
+  async function openImageFromUrl(url) {
+    if (!url) return false;
 
-    // 先尝试模拟真正的鼠标中键
-    a.dispatchEvent(new PointerEvent('pointerdown', {
-      button: 1, bubbles: true, cancelable: true, composed: true
-    }));
-    a.dispatchEvent(new MouseEvent('mousedown', {
-      button: 1, bubbles: true, cancelable: true
-    }));
-    a.dispatchEvent(new MouseEvent('mouseup', {
-      button: 1, bubbles: true, cancelable: true
-    }));
-    a.dispatchEvent(new MouseEvent('auxclick', {
-      button: 1, bubbles: true, cancelable: true
-    }));
+    // 方式1：chrome.tabs.create（扩展 API，绕过弹窗拦截器）
+    try {
+      const tab = await chrome.tabs.create({ url, active: false });
+      if (tab) {
+        console.log(`${LOG} [Save] ✓ tabs.create 打开: ${url}`);
+        return true;
+      }
+    } catch (e) {
+      console.log(`${LOG} [Save] tabs.create 失败: ${e.message}`);
+    }
 
-    // 方式B：window.open 作为后备（部分浏览器不响应 programmatic 中键）
-    setTimeout(() => {
-      // 尝试 Ctrl+Click
-      a.dispatchEvent(new MouseEvent('click', {
-        button: 0, ctrlKey: true, bubbles: true, cancelable: true
-      }));
-      setTimeout(() => a.remove(), 1000);
-    }, 100);
+    // 方式2：window.open（可能被弹窗拦截器拦截）
+    const win = window.open(url, '_blank', 'noopener');
+    if (win) {
+      console.log(`${LOG} [Save] ✓ window.open 打开: ${url}`);
+      return true;
+    }
+    console.log(`${LOG} [Save] window.open 被拦截，尝试直接下载...`);
+
+    // 方式3：chrome.downloads.download（通过 background.js 直接下载）
+    try {
+      const resp = await chrome.runtime.sendMessage({ action: 'download', url });
+      if (resp && resp.success) {
+        console.log(`${LOG} [Save] ✓ downloads.download 已开始: ${url}`);
+        return true;
+      }
+      console.log(`${LOG} [Save] downloads API 返回失败: ${JSON.stringify(resp)}`);
+    } catch (e) {
+      console.log(`${LOG} [Save] downloads API 调用失败: ${e.message}`);
+    }
+
+    return false;
   }
 
   // ═══════════════════════════════════════════════════════════════
